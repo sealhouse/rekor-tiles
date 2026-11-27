@@ -197,3 +197,5 @@ tool (
 	github.com/google/addlicense
 	golang.org/x/tools/cmd/goimports
 )
+
+replace github.com/coreos/go-oidc/v3 => github.com/sealhouse/go-oidc/v3 v3.21.1-rhtas.1
