@@ -290,9 +290,6 @@ func testIdentityReadWrite(t *testing.T, config backendConfig) {
 }
 
 func testIdentityOIDC(t *testing.T, config backendConfig) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
 	// get verifier needed for both read and write
 	serverPubKeyPEM, err := os.ReadFile(identityServerPublicKey)
 	require.NoError(t, err)
@@ -303,107 +300,129 @@ func testIdentityOIDC(t *testing.T, config backendConfig) {
 
 	reader, err := read.NewReader(config.StorageURL, defaultRekorHostname, verifier)
 	require.NoError(t, err)
-	checkpoint, _, err := reader.ReadCheckpoint(ctx)
-	require.NoError(t, err)
-	initialTreeSize := checkpoint.Size
 
-	fetchOIDCToken := func() string {
-		t.Helper()
-		tokResp, err := http.Get("http://localhost:8080/token?issuer=http://fakeoidc:8080")
-		require.NoError(t, err)
-		defer tokResp.Body.Close()
-		require.Equal(t, http.StatusOK, tokResp.StatusCode)
-		tokBytes, err := io.ReadAll(tokResp.Body)
-		require.NoError(t, err)
-		return string(tokBytes)
-	}
-	tok := fetchOIDCToken()
-
-	// Create a random message hash
-	message := make([]byte, 32)
-	_, _ = rand.Read(message)
-	msgHash := sha256.Sum256(message)
-
-	req := &pb.IdentityRequestV001{
-		Credential: &pb.IdentityRequestV001_Oidc{
-			Oidc: &pb.OidcCredential{
-				Token: tok,
-			},
+	tests := []struct {
+		name string
+		alg  string
+	}{
+		{
+			name: "RS256",
+			alg:  "RS256",
 		},
-		Message: msgHash[:],
-	}
-
-	b, err := protojson.Marshal(req)
-	require.NoError(t, err)
-
-	url := fmt.Sprintf("%s/api/v2/log/entries", config.ServerURL)
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(b))
-	require.NoError(t, err)
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(httpReq)
-	require.NoError(t, err)
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-
-	require.Equal(t, http.StatusCreated, resp.StatusCode, "Expected 201 Created, got: %s", string(respBody))
-
-	// Ensure the response is a tlog-proof object
-	t.Logf("Response body: %s", string(respBody))
-
-	expectedExtraData := []byte("identity:foo@bar.com\nissuer:http://fakeoidc:8080\nsubject:foo@bar.com")
-
-	noteVerifier, err := note.NewNoteVerifier(defaultRekorHostname, verifier)
-	require.NoError(t, err)
-
-	witnessNoteVerifier, err := f_note.NewVerifierForCosignatureV1(identityWitnessVKey)
-	require.NoError(t, err)
-
-	noteVerifiers := []signednote.Verifier{noteVerifier, witnessNoteVerifier}
-
-	claims := map[string]string{
-		"identity": "foo@bar.com",
-		"issuer":   "http://fakeoidc:8080",
-		"subject":  "foo@bar.com",
-	}
-	leafHash, err := identity_v1.ToOIDCEntryHash(req.Message, claims)
-	require.NoError(t, err)
-
-	pr, _ := verifyIdentityProof(t, respBody, leafHash, expectedExtraData, noteVerifiers)
-	assert.Equal(t, initialTreeSize, pr.Index, "Index should match the tree size from before uploading")
-
-	// Submitting the same digest with a fresh OIDC token should return 200 OK with a recalculated tlog-proof
-	freshTok := fetchOIDCToken()
-	if freshTok == tok {
-		time.Sleep(time.Second)
-		freshTok = fetchOIDCToken()
-	}
-	require.NotEqual(t, tok, freshTok, "Expected a distinct OIDC token for duplicate submission")
-	dupPayload, err := protojson.Marshal(&pb.IdentityRequestV001{
-		Credential: &pb.IdentityRequestV001_Oidc{
-			Oidc: &pb.OidcCredential{
-				Token: freshTok,
-			},
+		{
+			name: "ML_DSA_44",
+			alg:  "ML-DSA-44",
 		},
-		Message: msgHash[:],
-	})
-	require.NoError(t, err)
+	}
 
-	dupReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(dupPayload))
-	require.NoError(t, err)
-	dupReq.Header.Set("Content-Type", "application/json")
-	dupResp, err := client.Do(dupReq)
-	require.NoError(t, err)
-	defer dupResp.Body.Close()
-	dupBody, err := io.ReadAll(dupResp.Body)
-	require.NoError(t, err)
-	require.Equal(t, http.StatusOK, dupResp.StatusCode, "Expected 200 OK, got: %s", string(dupBody))
-	assert.Equal(t, "text/plain", dupResp.Header.Get("Content-Type"))
-	assert.Empty(t, dupResp.Header.Get("x-log-index"))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
 
-	dupPr, _ := verifyIdentityProof(t, dupBody, leafHash, expectedExtraData, noteVerifiers)
-	assert.Equal(t, pr.Index, dupPr.Index)
+			checkpoint, _, err := reader.ReadCheckpoint(ctx)
+			require.NoError(t, err)
+			initialTreeSize := checkpoint.Size
+
+			fetchOIDCToken := func() string {
+				t.Helper()
+				tokResp, err := http.Get(fmt.Sprintf("http://localhost:8080/token?issuer=http://fakeoidc:8080&alg=%s", tt.alg))
+				require.NoError(t, err)
+				defer tokResp.Body.Close()
+				require.Equal(t, http.StatusOK, tokResp.StatusCode)
+				tokBytes, err := io.ReadAll(tokResp.Body)
+				require.NoError(t, err)
+				return string(tokBytes)
+			}
+			tok := fetchOIDCToken()
+
+			// Create a random message hash
+			message := make([]byte, 32)
+			_, _ = rand.Read(message)
+			msgHash := sha256.Sum256(message)
+
+			req := &pb.IdentityRequestV001{
+				Credential: &pb.IdentityRequestV001_Oidc{
+					Oidc: &pb.OidcCredential{
+						Token: tok,
+					},
+				},
+				Message: msgHash[:],
+			}
+
+			b, err := protojson.Marshal(req)
+			require.NoError(t, err)
+
+			url := fmt.Sprintf("%s/api/v2/log/entries", config.ServerURL)
+			httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(b))
+			require.NoError(t, err)
+			httpReq.Header.Set("Content-Type", "application/json")
+
+			client := &http.Client{}
+			resp, err := client.Do(httpReq)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+
+			respBody, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+
+			require.Equal(t, http.StatusCreated, resp.StatusCode, "Expected 201 Created, got: %s", string(respBody))
+
+			// Ensure the response is a tlog-proof object
+			t.Logf("Response body: %s", string(respBody))
+
+			expectedExtraData := []byte("identity:foo@bar.com\nissuer:http://fakeoidc:8080\nsubject:foo@bar.com")
+
+			noteVerifier, err := note.NewNoteVerifier(defaultRekorHostname, verifier)
+			require.NoError(t, err)
+
+			witnessNoteVerifier, err := f_note.NewVerifierForCosignatureV1(identityWitnessVKey)
+			require.NoError(t, err)
+
+			noteVerifiers := []signednote.Verifier{noteVerifier, witnessNoteVerifier}
+
+			claims := map[string]string{
+				"identity": "foo@bar.com",
+				"issuer":   "http://fakeoidc:8080",
+				"subject":  "foo@bar.com",
+			}
+			leafHash, err := identity_v1.ToOIDCEntryHash(req.Message, claims)
+			require.NoError(t, err)
+
+			pr, _ := verifyIdentityProof(t, respBody, leafHash, expectedExtraData, noteVerifiers)
+			assert.Equal(t, initialTreeSize, pr.Index, "Index should match the tree size from before uploading")
+
+			// Submitting the same digest with a fresh OIDC token should return 200 OK with a recalculated tlog-proof
+			freshTok := fetchOIDCToken()
+			if freshTok == tok {
+				time.Sleep(time.Second)
+				freshTok = fetchOIDCToken()
+			}
+			require.NotEqual(t, tok, freshTok, "Expected a distinct OIDC token for duplicate submission")
+			dupPayload, err := protojson.Marshal(&pb.IdentityRequestV001{
+				Credential: &pb.IdentityRequestV001_Oidc{
+					Oidc: &pb.OidcCredential{
+						Token: freshTok,
+					},
+				},
+				Message: msgHash[:],
+			})
+			require.NoError(t, err)
+
+			dupReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(dupPayload))
+			require.NoError(t, err)
+			dupReq.Header.Set("Content-Type", "application/json")
+			dupResp, err := client.Do(dupReq)
+			require.NoError(t, err)
+			defer dupResp.Body.Close()
+			dupBody, err := io.ReadAll(dupResp.Body)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusOK, dupResp.StatusCode, "Expected 200 OK, got: %s", string(dupBody))
+			assert.Equal(t, "text/plain", dupResp.Header.Get("Content-Type"))
+			assert.Empty(t, dupResp.Header.Get("x-log-index"))
+
+			dupPr, _ := verifyIdentityProof(t, dupBody, leafHash, expectedExtraData, noteVerifiers)
+			assert.Equal(t, pr.Index, dupPr.Index)
+		})
+	}
 }
